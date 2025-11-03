@@ -1,0 +1,388 @@
+import argparse
+import os
+import math
+import glob
+import xml.etree.ElementTree as ET
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+from PIL import Image
+import torch
+import torch.nn.functional as F
+from transformers import CLIPModel, CLIPProcessor
+from sklearn.metrics import average_precision_score, roc_auc_score
+
+from clip_concept_attention import compute_patch_saliency_joint
+
+
+def normalize_text(s: str) -> str:
+    s = s.strip().lower()
+    s = s.replace("_", " ")
+    s = s.replace("-", " ")
+    return " ".join(s.split())
+
+
+CONCEPT_PROMPT_MAP: Dict[str, str] = {
+    # MonuMAI concepts (normalize variations to a clean text prompt)
+    "lobed arch": "lobed arch",
+    "porthole": "porthole",
+    "broken pediment": "broken pediment",
+    "solomonic column": "solomonic column",
+    "pointed arch": "pointed arch",
+    "serliana": "serliana",
+    "trefoil arch": "trefoil arch",
+    "rounded arch": "rounded arch",
+    "ogee arch": "ogee arch",
+}
+
+
+SCENARIOS = [
+    ("hispanic-muslim", "baroque", "lobed arch"),
+    ("baroque", "renaissance", "porthole"),
+    ("baroque", "gothic", "broken pediment"),
+    ("baroque", "renaissance", "solomonic column"),
+    ("gothic", "hispanic-muslim", "pointed arch"),
+    ("renaissance", "baroque", "serliana"),
+    ("gothic", "baroque", "trefoil arch"),
+    ("baroque", "renaissance", "rounded arch"),
+    ("gothic", "renaissance", "ogee arch"),
+]
+
+
+def infer_class_from_path(path: str) -> Optional[str]:
+    lower = path.lower()
+    for cls in ["baroque", "gothic", "renaissance", "hispanic-muslim"]:
+        if f"/{cls}/" in lower or lower.endswith(f"/{cls}"):
+            return cls
+    # fallback: use immediate parent dir name
+    base = os.path.basename(os.path.dirname(path)).lower()
+    if base in {"baroque", "gothic", "renaissance", "hispanic-muslim"}:
+        return base
+    return None
+
+
+def find_xml_for_image(img_path: str) -> Optional[str]:
+    stem = os.path.splitext(os.path.basename(img_path))[0]
+    d = os.path.dirname(img_path)
+    candidates = [
+        os.path.join(d, f"{stem}.xml"),
+        os.path.join(d, "xml", f"{stem}.xml"),
+        os.path.join(os.path.dirname(d), "xml", f"{stem}.xml"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def parse_monumai_xml(xml_path: str) -> Tuple[List[Tuple[str, Tuple[int, int, int, int]]], Optional[str], Tuple[int, int]]:
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    filename = root.findtext("filename")
+    folder = root.findtext("folder")
+    width = root.findtext("size/width")
+    height = root.findtext("size/height")
+    try:
+        W = int(width) if width is not None else None
+        H = int(height) if height is not None else None
+    except Exception:
+        W, H = None, None
+
+    objects: List[Tuple[str, Tuple[int, int, int, int]]] = []
+    for obj in root.findall("object"):
+        name_tag = obj.findtext("name") or ""
+        bnd = obj.find("bndbox")
+        if bnd is None:
+            continue
+        try:
+            xmin = int(float(bnd.findtext("xmin")))
+            ymin = int(float(bnd.findtext("ymin")))
+            xmax = int(float(bnd.findtext("xmax")))
+            ymax = int(float(bnd.findtext("ymax")))
+        except Exception:
+            continue
+        c_name = normalize_text(name_tag)
+        # try to map to known set if possible
+        if c_name in CONCEPT_PROMPT_MAP:
+            mapped = CONCEPT_PROMPT_MAP[c_name]
+        else:
+            mapped = c_name
+        objects.append((mapped, (xmin, ymin, xmax, ymax)))
+
+    clabel = folder.lower() if folder else None
+    return objects, clabel, (W or -1, H or -1)
+
+
+def transform_boxes_to_clip_coords(boxes: List[Tuple[int, int, int, int]], orig_size: Tuple[int, int], target_size: int = 224) -> List[Tuple[int, int, int, int]]:
+    W, H = orig_size
+    if W <= 0 or H <= 0:
+        return []
+    short = min(W, H)
+    scale = target_size / short
+    new_w = int(round(W * scale))
+    new_h = int(round(H * scale))
+    # center crop to target_size x target_size
+    left = max(0, (new_w - target_size) // 2)
+    top = max(0, (new_h - target_size) // 2)
+
+    out: List[Tuple[int, int, int, int]] = []
+    for (xmin, ymin, xmax, ymax) in boxes:
+        x0 = int(round(xmin * scale)) - left
+        y0 = int(round(ymin * scale)) - top
+        x1 = int(round(xmax * scale)) - left
+        y1 = int(round(ymax * scale)) - top
+        x0 = max(0, min(target_size, x0))
+        y0 = max(0, min(target_size, y0))
+        x1 = max(0, min(target_size, x1))
+        y1 = max(0, min(target_size, y1))
+        if x1 > x0 and y1 > y0:
+            out.append((x0, y0, x1, y1))
+    return out
+
+
+def boxes_to_mask(boxes: List[Tuple[int, int, int, int]], size: Tuple[int, int]) -> np.ndarray:
+    W, H = size
+    mask = np.zeros((H, W), dtype=np.uint8)
+    for (x0, y0, x1, y1) in boxes:
+        mask[y0:y1, x0:x1] = 1
+    return mask
+
+
+def upsample_saliency_to_pixels(sal: np.ndarray, image_size: int) -> np.ndarray:
+    # sal is (H_p, W_p) or (N,) flattened
+    if sal.ndim == 1:
+        s = int(math.sqrt(int(sal.size)))
+        sal = sal.reshape(s, s)
+    h_p, w_p = sal.shape
+    scale_y = image_size // h_p
+    scale_x = image_size // w_p
+    sal_up = np.kron(sal, np.ones((scale_y, scale_x), dtype=sal.dtype))
+    # ensure exact size
+    sal_up = sal_up[:image_size, :image_size]
+    return sal_up
+
+
+def compute_patch_grid_sizes(model: CLIPModel) -> Tuple[int, int]:
+    image_size = getattr(model.vision_model.config, "image_size", 224)
+    patch_size = getattr(model.vision_model.config, "patch_size", 32)
+    if isinstance(patch_size, (tuple, list)):
+        patch_size = patch_size[0]
+    h_p = image_size // patch_size
+    w_p = image_size // patch_size
+    return h_p, w_p
+
+
+def compute_image_text_score(model: CLIPModel, processor: CLIPProcessor, img: Image.Image, concept_text: str, device: torch.device) -> float:
+    with torch.no_grad():
+        text_inputs = processor(text=[concept_text], return_tensors="pt", padding=True).to(device)
+        text_features = model.get_text_features(**text_inputs)
+        inputs = processor(images=img, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(device)
+        img_features = model.get_image_features(pixel_values=pixel_values)
+        img_features = F.normalize(img_features, dim=-1)
+        text_features = F.normalize(text_features, dim=-1)
+        score = torch.einsum("bd,bd->b", img_features, text_features).item()
+    return float(score)
+
+
+def compute_saliency_for_image(model: CLIPModel, processor: CLIPProcessor, img: Image.Image, concept_text: str, device: torch.device) -> Tuple[np.ndarray, int]:
+    # returns (saliency_vector length N, image_size)
+    image_size = getattr(model.vision_model.config, "image_size", 224)
+    with torch.no_grad():
+        text_inputs = processor(text=[concept_text], return_tensors="pt", padding=True).to(device)
+        text_features = model.get_text_features(**text_inputs)
+        inputs = processor(images=img, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(device)
+        vis_outputs = model.vision_model(pixel_values=pixel_values, output_hidden_states=False)
+        o_x = vis_outputs.last_hidden_state
+        if o_x.shape[1] > 1:
+            o_x_for_sal = o_x[:, 1:, :]
+        else:
+            o_x_for_sal = o_x
+        sal = compute_patch_saliency_joint(model, o_x_for_sal, text_features)
+        sal_vec = sal[0]  # (N,)
+    return sal_vec, image_size
+
+
+def evaluate_localization(pairs: List[Tuple[str, str, List[Tuple[int, int, int, int]]]], model_name: str, device: torch.device) -> Dict[str, float]:
+    model = CLIPModel.from_pretrained(model_name).to(device)
+    processor = CLIPProcessor.from_pretrained(model_name)
+
+    ious: List[float] = []
+    accs: List[float] = []
+    aps: List[float] = []
+
+    for img_path, concept_text, boxes in pairs:
+        try:
+            img = Image.open(img_path).convert("RGB")
+        except Exception:
+            continue
+
+        sal_vec, image_size = compute_saliency_for_image(model, processor, img, concept_text, device)
+        sal_grid = upsample_saliency_to_pixels(sal_vec, image_size)  # (H, W)
+
+        orig_W, orig_H = img.size
+        boxes_224 = transform_boxes_to_clip_coords(boxes, (orig_W, orig_H), target_size=image_size)
+        if not boxes_224:
+            # no positives; skip for localization
+            continue
+        gt_mask = boxes_to_mask(boxes_224, (image_size, image_size))  # (H, W)
+
+        # threshold saliency at mean (matches h_m definition style)
+        thr = float(sal_grid.mean())
+        pred_bin = (sal_grid > thr).astype(np.uint8)
+
+        # IoU
+        inter = np.logical_and(pred_bin == 1, gt_mask == 1).sum()
+        union = np.logical_or(pred_bin == 1, gt_mask == 1).sum()
+        iou = float(inter) / float(union) if union > 0 else 0.0
+        ious.append(iou)
+
+        # Pixel Accuracy
+        acc = float((pred_bin == gt_mask).sum()) / float(gt_mask.size)
+        accs.append(acc)
+
+        # Pixel-wise AP
+        y_true = gt_mask.flatten().astype(np.uint8)
+        y_score = sal_grid.flatten().astype(np.float32)
+        if y_true.max() > 0:  # only compute AP if positives exist
+            ap = float(average_precision_score(y_true, y_score))
+            aps.append(ap)
+
+    metrics = {
+        "PixelAcc": float(np.mean(accs)) if accs else 0.0,
+        "mIoU": float(np.mean(ious)) if ious else 0.0,
+        "mAP": float(np.mean(aps)) if aps else 0.0,
+    }
+    return metrics
+
+
+def evaluate_detection_scenarios(samples: List[Tuple[str, str, str, List[str]]], model_name: str, device: torch.device) -> Dict[str, float]:
+    """
+    samples: list of (img_path, cls_label, concept_text, present_concepts)
+    Returns mean AUROC over the defined scenarios using CLIP image-text similarity S.
+    """
+    model = CLIPModel.from_pretrained(model_name).to(device)
+    processor = CLIPProcessor.from_pretrained(model_name)
+
+    aucs: List[float] = []
+
+    for (c1, c2, k) in SCENARIOS:
+        # gather subsets
+        scores_present: List[float] = []
+        scores_absent_c1: List[float] = []
+        scores_absent_c2: List[float] = []
+        for img_path, cls_label, _, present_list in samples:
+            if cls_label != c1 and cls_label != c2:
+                continue
+            # concept present in image?
+            is_present = any(normalize_text(x) == k for x in present_list)
+            try:
+                img = Image.open(img_path).convert("RGB")
+            except Exception:
+                continue
+            s = compute_image_text_score(model, processor, img, k, device)
+            if cls_label == c1 and is_present:
+                scores_present.append(s)
+            elif cls_label == c1 and not is_present:
+                scores_absent_c1.append(s)
+            elif cls_label == c2:
+                scores_absent_c2.append(s)
+
+        # present vs (absent in c1 + c2) AUROC
+        y_true: List[int] = []
+        y_score: List[float] = []
+        for s in scores_present:
+            y_true.append(1)
+            y_score.append(s)
+        for s in (scores_absent_c1 + scores_absent_c2):
+            y_true.append(0)
+            y_score.append(s)
+
+        if len(set(y_true)) == 2 and len(y_true) >= 3:
+            try:
+                auc = float(roc_auc_score(y_true, y_score))
+                aucs.append(auc)
+            except Exception:
+                pass
+
+    return {"AUROC_mean": float(np.mean(aucs)) if aucs else 0.0, "AUROC_count": len(aucs)}
+
+
+def collect_dataset_pairs(dataset_root: str) -> Tuple[List[Tuple[str, str, List[Tuple[int, int, int, int]]]], List[Tuple[str, str, str, List[str]]]]:
+    """
+    Returns:
+      - localization_pairs: list of (img_path, concept_text, boxes)
+      - detection_samples: list of (img_path, cls_label, concept_text_placeholder, present_concepts)
+    concept_text_placeholder is unused in detection but kept for clarity.
+    """
+    image_globs = ["**/*.jpg", "**/*.jpeg", "**/*.png", "**/*.JPG", "**/*.PNG"]
+    image_paths: List[str] = []
+    for g in image_globs:
+        image_paths.extend(glob.glob(os.path.join(dataset_root, g), recursive=True))
+
+    localization_pairs: List[Tuple[str, str, List[Tuple[int, int, int, int]]]] = []
+    detection_samples: List[Tuple[str, str, str, List[str]]] = []
+
+    for img_path in image_paths:
+        xml_path = find_xml_for_image(img_path)
+        if not xml_path:
+            continue
+        try:
+            objects, xml_folder, (W, H) = parse_monumai_xml(xml_path)
+        except Exception:
+            continue
+
+        cls_label = infer_class_from_path(img_path) or (xml_folder if xml_folder else "")
+        cls_label = normalize_text(cls_label)
+        present_concepts: List[str] = []
+
+        # group by concept
+        concept_to_boxes: Dict[str, List[Tuple[int, int, int, int]]] = {}
+        for cname, box in objects:
+            cname_norm = normalize_text(cname)
+            present_concepts.append(cname_norm)
+            concept_to_boxes.setdefault(cname_norm, []).append(box)
+
+        # localization for images where concept is present
+        for cname_norm, boxes in concept_to_boxes.items():
+            concept_text = CONCEPT_PROMPT_MAP.get(cname_norm, cname_norm)
+            localization_pairs.append((img_path, concept_text, boxes))
+
+        # detection sample entry
+        detection_samples.append((img_path, cls_label, "", present_concepts))
+
+    return localization_pairs, detection_samples
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate Concept Attention (patch saliency) on MonuMAI")
+    parser.add_argument("--dataset-root", type=str, required=True, help="Path to MonuMAI dataset root")
+    parser.add_argument("--model-name", type=str, default="openai/clip-vit-base-patch32")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--no-detection", action="store_true", help="Skip detection AUROC computation")
+    parser.add_argument("--no-localization", action="store_true", help="Skip localization metrics")
+    args = parser.parse_args()
+
+    device = torch.device(args.device)
+    print("Device:", device)
+    print("Collecting dataset entries ...")
+    localization_pairs, detection_samples = collect_dataset_pairs(args.dataset_root)
+    print(f"Found {len(localization_pairs)} localization pairs and {len(detection_samples)} images with XML.")
+
+    if not args.no_localization:
+        print("Running localization evaluation (PixelAcc, mIoU, mAP) ...")
+        loc_metrics = evaluate_localization(localization_pairs, args.model_name, device)
+        print("Localization:", loc_metrics)
+
+    if not args.no_detection:
+        print("Running scenario-based detection AUROC ...")
+        det_metrics = evaluate_detection_scenarios(detection_samples, args.model_name, device)
+        print("Detection:", det_metrics)
+
+
+if __name__ == "__main__":
+    main()
+
+
