@@ -1,6 +1,7 @@
 import argparse
 import os
-from typing import Dict, List, Tuple
+import math
+from typing import Dict, List, Tuple, Optional
 
 import torch
 from PIL import Image
@@ -155,7 +156,7 @@ def evaluate_pointing(
     with torch.no_grad():
         text_inputs = processor(text=concept_text, return_tensors="pt", padding=True)
         text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
-        text_features = model.get_text_features(**text_inputs).detach()
+        base_text_features = model.get_text_features(**text_inputs).detach()  # (1, D)
 
     total = 0
     success = 0
@@ -189,6 +190,9 @@ def evaluate_pointing(
             else:
                 o_x_for_sal = o_x
 
+            # Expand text features to match batch
+            bsz = o_x_for_sal.shape[0]
+            text_features = base_text_features.repeat(bsz, 1)
             sal = compute_patch_saliency_joint(model, o_x_for_sal, text_features)
 
         for b in range(len(batch_ids)):
@@ -209,9 +213,293 @@ def evaluate_pointing(
     return {"pointing_game_accuracy": acc, "num_images": float(total)}
 
 
+# ---------------------------- Part-level utilities ----------------------------
+
+def transform_point_to_224(x: float, y: float, orig_w: int, orig_h: int, target: int = 224) -> Tuple[float, float]:
+    if orig_w <= 0 or orig_h <= 0:
+        return 0.0, 0.0
+    scale = target / float(min(orig_w, orig_h))
+    new_w = int(round(orig_w * scale))
+    new_h = int(round(orig_h * scale))
+    x_s = x * scale
+    y_s = y * scale
+    off_x, off_y = center_crop_params(new_w, new_h, target)
+    x_c = x_s - off_x
+    y_c = y_s - off_y
+    x_c = max(0.0, min(float(target), x_c))
+    y_c = max(0.0, min(float(target), y_c))
+    return x_c, y_c
+
+
+def read_cub_parts(cub_root: str) -> Tuple[Dict[int, str], Dict[str, int]]:
+    parts_txt = os.path.join(cub_root, "parts", "parts.txt")
+    part_id_to_name: Dict[int, str] = {}
+    name_to_part_id: Dict[str, int] = {}
+    with open(parts_txt, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            # Format: part_id part_name
+            pid_str, *name_tokens = line.split()
+            pid = int(pid_str)
+            name = " ".join(name_tokens)
+            name_l = name.strip().lower()
+            part_id_to_name[pid] = name_l
+            name_to_part_id[name_l] = pid
+    return part_id_to_name, name_to_part_id
+
+
+def read_cub_part_locs(cub_root: str) -> Dict[int, List[Tuple[int, float, float, int]]]:
+    locs_txt = os.path.join(cub_root, "parts", "part_locs.txt")
+    image_to_parts: Dict[int, List[Tuple[int, float, float, int]]] = {}
+    with open(locs_txt, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            # Format: image_id part_id x y visible
+            img_id_str, part_id_str, x_str, y_str, vis_str = line.split()
+            img_id = int(img_id_str)
+            part_id = int(part_id_str)
+            x = float(x_str)
+            y = float(y_str)
+            visible = int(vis_str)
+            image_to_parts.setdefault(img_id, []).append((part_id, x, y, visible))
+    return image_to_parts
+
+
+def build_default_concept_to_parts(part_id_to_name: Dict[int, str]) -> Dict[str, List[int]]:
+    # Known CUB parts often include: back, beak, belly, breast, crown, forehead,
+    # left eye, right eye, left leg, right leg, left wing, right wing, nape, tail, throat
+    name_map = {pid: name.lower() for pid, name in part_id_to_name.items()}
+
+    def ids_with(tokens: List[str]) -> List[int]:
+        out: List[int] = []
+        for pid, nm in name_map.items():
+            for t in tokens:
+                if t in nm:
+                    out.append(pid)
+                    break
+        return out
+
+    def exact(names: List[str]) -> List[int]:
+        targets = set([n.lower() for n in names])
+        return [pid for pid, nm in name_map.items() if nm in targets]
+
+    concept_to_parts: Dict[str, List[int]] = {}
+    concept_to_parts["beak"] = ids_with(["beak", "bill"]) or exact(["beak"])  # robustness
+    concept_to_parts["wing"] = ids_with(["wing"])  # left/right wing
+    concept_to_parts["eye"] = ids_with(["eye"])    # left/right eye
+    concept_to_parts["leg"] = ids_with(["leg"])    # left/right leg
+    concept_to_parts["tail"] = ids_with(["tail"])  # tail
+    # Head composite: crown, forehead, nape, throat, beak, eyes
+    head_tokens = ["crown", "forehead", "nape", "throat", "beak", "bill", "eye", "head"]
+    concept_to_parts["head"] = ids_with(head_tokens)
+    # Optional torso concepts
+    concept_to_parts["breast"] = ids_with(["breast"]) or exact(["breast"])
+    concept_to_parts["belly"] = ids_with(["belly"]) or exact(["belly"])
+    concept_to_parts["back"] = ids_with(["back"]) or exact(["back"])
+
+    # Remove empty entries
+    concept_to_parts = {k: v for k, v in concept_to_parts.items() if len(v) > 0}
+    return concept_to_parts
+
+
+def compute_peak_xy(
+    sal_vec: np.ndarray,
+    grid_h: int,
+    grid_w: int,
+    target: int,
+    method: str = "argmax",
+) -> Tuple[float, float]:
+    if sal_vec.size == 0:
+        return 0.0, 0.0
+    if method == "argmax":
+        argmax_idx = int(np.argmax(sal_vec))
+        return patch_index_to_center_xy(argmax_idx, grid_h, grid_w, target)
+    # center of mass
+    cell_h = target / float(grid_h)
+    cell_w = target / float(grid_w)
+    idxs = np.arange(sal_vec.size)
+    rows = (idxs // grid_w).astype(np.float32)
+    cols = (idxs % grid_w).astype(np.float32)
+    cx = np.sum(sal_vec * ((cols + 0.5) * cell_w))
+    cy = np.sum(sal_vec * ((rows + 0.5) * cell_h))
+    return float(cx), float(cy)
+
+
+def compute_radius(
+    tr_box: Tuple[float, float, float, float],
+    target: int,
+    radius_mode: str,
+    radius_ratio: float,
+    radius_px: Optional[float],
+) -> float:
+    if radius_mode == "abs" and radius_px is not None:
+        return float(radius_px)
+    bx, by, bw, bh = tr_box
+    if radius_mode == "bbox":
+        base = math.sqrt(max(bw * bh, 1e-6))
+        return float(radius_ratio * base)
+    # minHW over the 224 crop (i.e., 224)
+    base = float(min(target, target))
+    return float(radius_ratio * base)
+
+
+def normalize_distance(
+    dist: float,
+    tr_box: Tuple[float, float, float, float],
+    target: int,
+    norm_mode: str,
+) -> float:
+    if norm_mode == "bbox":
+        _, _, bw, bh = tr_box
+        denom = max(math.sqrt(max(bw * bh, 1e-6)), 1e-6)
+        return float(dist / denom)
+    denom = float(min(target, target))
+    return float(dist / max(denom, 1e-6))
+
+
+def evaluate_part_pointing(
+    cub_root: str,
+    model_name: str,
+    concepts: List[str],
+    prompt_template: str,
+    split: str,
+    batch_size: int,
+    device: torch.device,
+    peak_method: str = "argmax",
+    radius_mode: str = "bbox",
+    radius_ratio: float = 0.1,
+    radius_px: Optional[float] = None,
+    norm_mode: str = "bbox",
+    max_images: int = None,
+) -> Dict[str, object]:
+    index = read_cub_index_files(cub_root)
+    image_ids: List[int] = [
+        i for i, rec in index.items() if (rec["is_train"] if split == "train" else not rec["is_train"])
+    ]
+    image_ids.sort()
+    if max_images is not None:
+        image_ids = image_ids[:max_images]
+
+    part_id_to_name, _ = read_cub_parts(cub_root)
+    concept_to_parts = build_default_concept_to_parts(part_id_to_name)
+    # Filter requested concepts by availability in the dataset
+    eval_concepts = [c for c in concepts if c in concept_to_parts]
+    if len(eval_concepts) == 0:
+        return {"error": "No requested concepts available in CUB parts."}
+
+    image_to_parts = read_cub_part_locs(cub_root)
+
+    model = CLIPModel.from_pretrained(model_name).to(device)
+    processor = CLIPProcessor.from_pretrained(model_name)
+    grid_h, grid_w, target = infer_patch_grid(model)
+
+    per_concept_stats: Dict[str, Dict[str, float]] = {
+        c: {"success": 0.0, "total": 0.0, "dists": []} for c in eval_concepts
+    }
+
+    for i in range(0, len(image_ids), batch_size):
+        batch_ids = image_ids[i : i + batch_size]
+        batch_imgs: List[Image.Image] = []
+        batch_boxes: List[Tuple[float, float, float, float]] = []
+        batch_sizes: List[Tuple[int, int]] = []
+
+        for image_id in batch_ids:
+            rel_path = index[image_id]["rel_path"]
+            abs_path = os.path.join(cub_root, "images", rel_path)
+            bbox = index[image_id]["bbox"]
+            img = Image.open(abs_path).convert("RGB")
+            w0, h0 = img.size
+            batch_imgs.append(img)
+            batch_boxes.append(bbox)
+            batch_sizes.append((w0, h0))
+
+        inputs = processor(images=batch_imgs, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(device)
+
+        with torch.no_grad():
+            vis_outputs = model.vision_model(pixel_values=pixel_values, output_hidden_states=False)
+            o_x = vis_outputs.last_hidden_state
+            o_x_for_sal = o_x[:, 1:, :] if o_x.shape[1] > 1 else o_x
+
+        # Evaluate each concept separately
+        for concept in eval_concepts:
+            prompt = prompt_template.format(concept=concept)
+            with torch.no_grad():
+                text_inputs = processor(text=prompt, return_tensors="pt", padding=True)
+                text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+                base_text_features = model.get_text_features(**text_inputs).detach()  # (1, D)
+                bsz = o_x_for_sal.shape[0]
+                text_features = base_text_features.repeat(bsz, 1)
+
+                sal = compute_patch_saliency_joint(model, o_x_for_sal, text_features)
+
+            mapped_part_ids = set(concept_to_parts[concept])
+
+            for b, image_id in enumerate(batch_ids):
+                # Ground truth visible keypoints for this concept
+                gt_points: List[Tuple[float, float]] = []
+                for (pid, x, y, vis) in image_to_parts.get(image_id, []):
+                    if vis != 1 or pid not in mapped_part_ids:
+                        continue
+                    orig_w, orig_h = batch_sizes[b]
+                    px, py = transform_point_to_224(x, y, orig_w, orig_h, target)
+                    gt_points.append((px, py))
+                if len(gt_points) == 0:
+                    continue  # skip if part not visible
+
+                tr_box = transform_bbox_to_224(batch_boxes[b], batch_sizes[b][0], batch_sizes[b][1], target)
+                radius = compute_radius(tr_box, target, radius_mode, radius_ratio, radius_px)
+
+                sal_vec = sal[b]
+                px_pred, py_pred = compute_peak_xy(sal_vec, grid_h, grid_w, target, peak_method)
+
+                # Distance to nearest visible keypoint
+                dists = [math.hypot(px_pred - gx, py_pred - gy) for (gx, gy) in gt_points]
+                d_min = min(dists)
+                d_norm = normalize_distance(d_min, tr_box, target, norm_mode)
+
+                per_concept_stats[concept]["total"] += 1.0
+                per_concept_stats[concept]["dists"].append(d_norm)
+                if d_min <= radius:
+                    per_concept_stats[concept]["success"] += 1.0
+
+    # Aggregate metrics
+    per_concept_metrics: Dict[str, Dict[str, float]] = {}
+    successes = 0.0
+    totals = 0.0
+    for c, stats in per_concept_stats.items():
+        tot = stats["total"]
+        suc = stats["success"]
+        acc = float(suc / tot) if tot > 0 else 0.0
+        dists = stats["dists"]
+        mean_d = float(np.mean(dists)) if len(dists) > 0 else 0.0
+        med_d = float(np.median(dists)) if len(dists) > 0 else 0.0
+        per_concept_metrics[c] = {
+            "pointing_accuracy": acc,
+            "num_images": float(tot),
+            "mean_norm_dist": mean_d,
+            "median_norm_dist": med_d,
+        }
+        successes += suc
+        totals += tot
+
+    micro = float(successes / totals) if totals > 0 else 0.0
+    macro = float(np.mean([m["pointing_accuracy"] for m in per_concept_metrics.values()])) if len(per_concept_metrics) > 0 else 0.0
+
+    return {
+        "per_concept": per_concept_metrics,
+        "micro_avg_pointing_accuracy": micro,
+        "macro_avg_pointing_accuracy": macro,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate pointing-game accuracy on CUB using CLIP concept saliency"
+        description="Evaluate object/part pointing-game on CUB using CLIP concept saliency"
     )
     parser.add_argument("--cub-root", type=str, required=True, help="Path to CUB_200_2011 root")
     parser.add_argument(
@@ -221,10 +509,29 @@ def main():
         help="HuggingFace CLIP model name",
     )
     parser.add_argument(
+        "--eval",
+        type=str,
+        default="object",
+        choices=["object", "part"],
+        help="Evaluation type: object bounding-box pointing or part keypoint pointing",
+    )
+    parser.add_argument(
         "--concept",
         type=str,
         default="bird",
-        help="Text concept to localize (default: 'bird')",
+        help="Text concept for object-level eval (default: 'bird')",
+    )
+    parser.add_argument(
+        "--concepts",
+        type=str,
+        default="beak,wing,tail,eye,leg,head",
+        help="Comma-separated concept list for part-level eval",
+    )
+    parser.add_argument(
+        "--prompt-template",
+        type=str,
+        default="a photo of a bird {concept}",
+        help="Prompt template for part concepts (use {concept})",
     )
     parser.add_argument(
         "--split",
@@ -235,23 +542,48 @@ def main():
     )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-images", type=int, default=None)
+    parser.add_argument("--peak", type=str, default="argmax", choices=["argmax", "com"], help="Peak selection")
+    parser.add_argument("--radius-mode", type=str, default="bbox", choices=["bbox", "minHW", "abs"], help="Part pointing radius mode")
+    parser.add_argument("--radius-ratio", type=float, default=0.1, help="Radius ratio for bbox/minHW modes")
+    parser.add_argument("--radius-px", type=float, default=None, help="Absolute radius in pixels when radius-mode=abs")
+    parser.add_argument("--norm-mode", type=str, default="bbox", choices=["bbox", "minHW"], help="Normalization for distance metrics")
     parser.add_argument("--out-json", type=str, default=None, help="Optional path to save metrics as JSON")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
-    print("Evaluating CUB pointing-game ...")
-    print(f"Model: {args.model_name} | Concept: '{args.concept}' | Split: {args.split}")
-
-    metrics = evaluate_pointing(
-        cub_root=args.cub_root,
-        model_name=args.model_name,
-        concept_text=args.concept,
-        split=args.split,
-        batch_size=args.batch_size,
-        device=device,
-        max_images=args.max_images,
-    )
+    print("Evaluating CUB ...")
+    if args.eval == "object":
+        print(f"Object-level pointing | Model: {args.model_name} | Concept: '{args.concept}' | Split: {args.split}")
+        metrics = evaluate_pointing(
+            cub_root=args.cub_root,
+            model_name=args.model_name,
+            concept_text=args.concept,
+            split=args.split,
+            batch_size=args.batch_size,
+            device=device,
+            max_images=args.max_images,
+        )
+    else:
+        concepts = [c.strip().lower() for c in args.concepts.split(",") if c.strip()]
+        print(
+            f"Part-level pointing | Model: {args.model_name} | Concepts: {concepts} | Split: {args.split} | Peak={args.peak}"
+        )
+        metrics = evaluate_part_pointing(
+            cub_root=args.cub_root,
+            model_name=args.model_name,
+            concepts=concepts,
+            prompt_template=args.prompt_template,
+            split=args.split,
+            batch_size=args.batch_size,
+            device=device,
+            peak_method=args.peak,
+            radius_mode=args.radius_mode,
+            radius_ratio=args.radius_ratio,
+            radius_px=args.radius_px,
+            norm_mode=args.norm_mode,
+            max_images=args.max_images,
+        )
     result = {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in metrics.items()}
     print(result)
     if args.out_json is not None:
