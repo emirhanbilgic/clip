@@ -1,0 +1,10 @@
+# Minimal deps for running CLIP pointing evaluation
+# Note: Kaggle already provides PyTorch; you usually don't need to reinstall it there.
+# If running locally without PyTorch, install torch as well (CPU-only example):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+transformers>=4.38.0
+pillow>=10.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+
