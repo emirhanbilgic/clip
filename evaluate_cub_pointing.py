@@ -10,7 +10,7 @@ from transformers import CLIPModel, CLIPProcessor
 import numpy as np
 
 # Reuse saliency from the existing implementation
-from clip_concept_attention import compute_patch_saliency_joint
+from clip_concept_attention import compute_patch_saliency_joint, visualize_saliency_on_image
 
 
 def read_cub_index_files(cub_root: str) -> Dict[int, Dict]:
@@ -231,6 +231,18 @@ def transform_point_to_224(x: float, y: float, orig_w: int, orig_h: int, target:
     return x_c, y_c
 
 
+def make_224_center_crop(img: Image.Image, target: int = 224) -> Image.Image:
+    orig_w, orig_h = img.size
+    if orig_w <= 0 or orig_h <= 0:
+        return img
+    scale = target / float(min(orig_w, orig_h))
+    new_w = int(round(orig_w * scale))
+    new_h = int(round(orig_h * scale))
+    img_r = img.resize((new_w, new_h), resample=Image.BICUBIC)
+    off_x, off_y = center_crop_params(new_w, new_h, target)
+    return img_r.crop((off_x, off_y, off_x + target, off_y + target))
+
+
 def read_cub_parts(cub_root: str) -> Tuple[Dict[int, str], Dict[str, int]]:
     parts_txt = os.path.join(cub_root, "parts", "parts.txt")
     part_id_to_name: Dict[int, str] = {}
@@ -375,6 +387,8 @@ def evaluate_part_pointing(
     radius_px: Optional[float] = None,
     norm_mode: str = "bbox",
     max_images: int = None,
+    save_examples_dir: Optional[str] = None,
+    examples_per_concept: int = 0,
 ) -> Dict[str, object]:
     index = read_cub_index_files(cub_root)
     image_ids: List[int] = [
@@ -400,6 +414,9 @@ def evaluate_part_pointing(
     per_concept_stats: Dict[str, Dict[str, float]] = {
         c: {"success": 0.0, "total": 0.0, "dists": []} for c in eval_concepts
     }
+
+    # example saving bookkeeping
+    examples_saved: Dict[str, int] = {c: 0 for c in eval_concepts}
 
     for i in range(0, len(image_ids), batch_size):
         batch_ids = image_ids[i : i + batch_size]
@@ -466,6 +483,31 @@ def evaluate_part_pointing(
                 per_concept_stats[concept]["dists"].append(d_norm)
                 if d_min <= radius:
                     per_concept_stats[concept]["success"] += 1.0
+
+                # Save examples if requested
+                if save_examples_dir is not None and examples_per_concept > 0:
+                    if examples_saved[concept] < examples_per_concept:
+                        try:
+                            os.makedirs(os.path.join(save_examples_dir, concept), exist_ok=True)
+                            img_crop = make_224_center_crop(batch_imgs[b], target)
+                            title = f"{concept} | d={d_min:.1f} r={radius:.1f} {'✓' if d_min <= radius else '✗'}"
+                            out_path = os.path.join(
+                                save_examples_dir,
+                                concept,
+                                f"img{image_id}_ex{examples_saved[concept]+1}.png",
+                            )
+                            visualize_saliency_on_image(
+                                img_crop,
+                                sal_vec,
+                                (grid_h, grid_w),
+                                title=title,
+                                save_path=out_path,
+                                show=False,
+                            )
+                            examples_saved[concept] += 1
+                        except Exception as e:
+                            # Non-fatal: continue evaluation even if saving fails
+                            pass
 
     # Aggregate metrics
     per_concept_metrics: Dict[str, Dict[str, float]] = {}
@@ -547,6 +589,8 @@ def main():
     parser.add_argument("--radius-ratio", type=float, default=0.1, help="Radius ratio for bbox/minHW modes")
     parser.add_argument("--radius-px", type=float, default=None, help="Absolute radius in pixels when radius-mode=abs")
     parser.add_argument("--norm-mode", type=str, default="bbox", choices=["bbox", "minHW"], help="Normalization for distance metrics")
+    parser.add_argument("--save-examples-dir", type=str, default=None, help="Directory to save part-level heatmap examples")
+    parser.add_argument("--examples-per-concept", type=int, default=4, help="Number of examples to save per concept")
     parser.add_argument("--out-json", type=str, default=None, help="Optional path to save metrics as JSON")
     args = parser.parse_args()
 
@@ -583,6 +627,8 @@ def main():
             radius_px=args.radius_px,
             norm_mode=args.norm_mode,
             max_images=args.max_images,
+            save_examples_dir=args.save_examples_dir,
+            examples_per_concept=args.examples_per_concept,
         )
     result = {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in metrics.items()}
     print(result)
