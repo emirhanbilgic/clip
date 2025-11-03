@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 import torch
 import torch.nn.functional as F
 from transformers import CLIPModel, CLIPProcessor
@@ -173,6 +173,57 @@ def compute_patch_grid_sizes(model: CLIPModel) -> Tuple[int, int]:
     return h_p, w_p
 
 
+def transform_image_to_clip_224(img: Image.Image, target_size: int = 224) -> Image.Image:
+    W, H = img.size
+    if W <= 0 or H <= 0:
+        return img.convert("RGB").resize((target_size, target_size), Image.BICUBIC)
+    short = min(W, H)
+    scale = target_size / short
+    new_w = int(round(W * scale))
+    new_h = int(round(H * scale))
+    img_scaled = img.resize((new_w, new_h), Image.BICUBIC)
+    left = max(0, (new_w - target_size) // 2)
+    top = max(0, (new_h - target_size) // 2)
+    img_224 = img_scaled.crop((left, top, left + target_size, top + target_size))
+    return img_224
+
+
+def draw_boxes(image_224: Image.Image, boxes_224: List[Tuple[int, int, int, int]], color: Tuple[int, int, int] = (0, 255, 0), width: int = 2) -> Image.Image:
+    out = image_224.copy()
+    draw = ImageDraw.Draw(out)
+    for (x0, y0, x1, y1) in boxes_224:
+        for w in range(width):
+            draw.rectangle([x0 - w, y0 - w, x1 + w, y1 + w], outline=color)
+    return out
+
+
+def save_example_visualization(save_path: str, img_224: Image.Image, saliency_224: np.ndarray, boxes_224: List[Tuple[int, int, int, int]], title_left: str, title_right: str):
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig, ax = plt.subplots(1, 2, figsize=(9, 4))
+
+    # Left: GT boxes
+    img_gt = draw_boxes(img_224, boxes_224, color=(0, 255, 0), width=2)
+    ax[0].imshow(img_gt)
+    ax[0].axis("off")
+    ax[0].set_title(title_left)
+
+    # Right: saliency heatmap overlay + boxes
+    ax[1].imshow(img_224)
+    ax[1].imshow(saliency_224, cmap="jet", alpha=0.45, norm=Normalize(vmin=float(saliency_224.min()), vmax=float(saliency_224.max())))
+    # overlay boxes as green rectangles
+    for (x0, y0, x1, y1) in boxes_224:
+        ax[1].plot([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0], color="lime", linewidth=1.5)
+    ax[1].axis("off")
+    ax[1].set_title(title_right)
+
+    plt.tight_layout()
+    fig.savefig(save_path, bbox_inches="tight", dpi=180)
+    plt.close(fig)
+
+
 def compute_image_text_score(model: CLIPModel, processor: CLIPProcessor, img: Image.Image, concept_text: str, device: torch.device) -> float:
     with torch.no_grad():
         text_inputs = processor(text=[concept_text], return_tensors="pt", padding=True).to(device)
@@ -205,13 +256,15 @@ def compute_saliency_for_image(model: CLIPModel, processor: CLIPProcessor, img: 
     return sal_vec, image_size
 
 
-def evaluate_localization(pairs: List[Tuple[str, str, List[Tuple[int, int, int, int]]]], model_name: str, device: torch.device) -> Dict[str, float]:
+def evaluate_localization(pairs: List[Tuple[str, str, List[Tuple[int, int, int, int]]]], model_name: str, device: torch.device,
+                          save_examples_dir: Optional[str] = None, examples_per_class: int = 5) -> Dict[str, float]:
     model = CLIPModel.from_pretrained(model_name).to(device)
     processor = CLIPProcessor.from_pretrained(model_name)
 
     ious: List[float] = []
     accs: List[float] = []
     aps: List[float] = []
+    per_class_saved: Dict[str, int] = {}
 
     for img_path, concept_text, boxes in pairs:
         try:
@@ -249,6 +302,27 @@ def evaluate_localization(pairs: List[Tuple[str, str, List[Tuple[int, int, int, 
         if y_true.max() > 0:  # only compute AP if positives exist
             ap = float(average_precision_score(y_true, y_score))
             aps.append(ap)
+
+        # Optionally save example visualization
+        if save_examples_dir:
+            cls_label = infer_class_from_path(img_path) or "unknown"
+            cls_label = normalize_text(cls_label)
+            count = per_class_saved.get(cls_label, 0)
+            if count < examples_per_class:
+                img_224 = transform_image_to_clip_224(img, target_size=image_size)
+                # Ensure saliency grid is exactly 224x224
+                sal_224 = sal_grid.astype(np.float32)
+                # Compose filename
+                stem = os.path.splitext(os.path.basename(img_path))[0]
+                subdir = os.path.join(save_examples_dir, cls_label)
+                out_path = os.path.join(subdir, f"{stem}_{concept_text.replace(' ', '_')}.png")
+                title_l = f"GT: {cls_label} / {concept_text}"
+                title_r = "Saliency + GT"
+                try:
+                    save_example_visualization(out_path, img_224, sal_224, boxes_224, title_l, title_r)
+                    per_class_saved[cls_label] = count + 1
+                except Exception:
+                    pass
 
     metrics = {
         "PixelAcc": float(np.mean(accs)) if accs else 0.0,
@@ -363,6 +437,8 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no-detection", action="store_true", help="Skip detection AUROC computation")
     parser.add_argument("--no-localization", action="store_true", help="Skip localization metrics")
+    parser.add_argument("--save-examples-dir", type=str, default=None, help="Directory to save example visualizations")
+    parser.add_argument("--examples-per-class", type=int, default=5, help="Max examples to save per class")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -373,7 +449,9 @@ def main():
 
     if not args.no_localization:
         print("Running localization evaluation (PixelAcc, mIoU, mAP) ...")
-        loc_metrics = evaluate_localization(localization_pairs, args.model_name, device)
+        loc_metrics = evaluate_localization(localization_pairs, args.model_name, device,
+                                           save_examples_dir=args.save_examples_dir,
+                                           examples_per_class=args.examples_per_class)
         print("Localization:", loc_metrics)
 
     if not args.no_detection:
