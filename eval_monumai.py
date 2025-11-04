@@ -294,7 +294,7 @@ def compute_saliency_for_image(model: CLIPModel, processor: CLIPProcessor, img: 
 
 
 def evaluate_localization(pairs: List[Tuple[str, str, List[Tuple[int, int, int, int]]]], model_name: str, device: torch.device,
-                          save_examples_dir: Optional[str] = None, examples_per_class: int = 5) -> Dict[str, float]:
+                         save_examples_dir: Optional[str] = None, examples_per_class: int = 5, topk_percent: Optional[float] = None) -> Dict[str, float]:
     model = CLIPModel.from_pretrained(model_name).to(device)
     processor = CLIPProcessor.from_pretrained(model_name)
 
@@ -319,9 +319,14 @@ def evaluate_localization(pairs: List[Tuple[str, str, List[Tuple[int, int, int, 
             continue
         gt_mask = boxes_to_mask(boxes_224, (image_size, image_size))  # (H, W)
 
-        # threshold saliency at mean (matches h_m definition style)
-        thr = float(sal_grid.mean())
-        pred_bin = (sal_grid > thr).astype(np.uint8)
+        # Binarize saliency: keep top P% if specified, else mean threshold
+        if topk_percent is not None and 0.0 < float(topk_percent) < 100.0:
+            q = 1.0 - (float(topk_percent) / 100.0)
+            thr = float(np.quantile(sal_grid, q))
+            pred_bin = (sal_grid >= thr).astype(np.uint8)
+        else:
+            thr = float(sal_grid.mean())
+            pred_bin = (sal_grid > thr).astype(np.uint8)
 
         # IoU
         inter = np.logical_and(pred_bin == 1, gt_mask == 1).sum()
@@ -556,13 +561,14 @@ def collect_dataset_pairs(dataset_root: str) -> Tuple[List[Tuple[str, str, List[
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Concept Attention (patch saliency) on MonuMAI")
     parser.add_argument("--dataset-root", type=str, required=True, help="Path to MonuMAI dataset root")
-    parser.add_argument("--model-name", type=str, default="openai/clip-vit-base-patch32")
+    parser.add_argument("--model-name", type=str, default="openai/clip-vit-large-patch14-336")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no-detection", action="store_true", help="Skip detection AUROC computation")
     parser.add_argument("--no-localization", action="store_true", help="Skip localization metrics")
     parser.add_argument("--save-examples-dir", type=str, default=None, help="Directory to save example visualizations")
     parser.add_argument("--examples-per-class", type=int, default=5, help="Max examples to save per class")
     parser.add_argument("--trials", type=int, default=10, help="Number of balanced subsampling runs per scenario (paper default: 10)")
+    parser.add_argument("--topk-percent", type=float, default=None, help="Top-P percent of pixels to set as positive (0<P<100). If omitted, uses mean threshold.")
     parser.add_argument("--debug-detection", action="store_true", help="Print per-scenario counts and skip reasons for detection")
     args = parser.parse_args()
 
@@ -576,7 +582,8 @@ def main():
         print("Running localization evaluation (PixelAcc, mIoU, mAP) ...")
         loc_metrics = evaluate_localization(localization_pairs, args.model_name, device,
                                            save_examples_dir=args.save_examples_dir,
-                                           examples_per_class=args.examples_per_class)
+                                           examples_per_class=args.examples_per_class,
+                                           topk_percent=args.topk_percent)
         print("Localization:", loc_metrics)
 
     if not args.no_detection:
