@@ -369,54 +369,69 @@ def evaluate_localization(pairs: List[Tuple[str, str, List[Tuple[int, int, int, 
     return metrics
 
 
-def evaluate_detection_scenarios(samples: List[Tuple[str, str, str, List[str]]], model_name: str, device: torch.device) -> Dict[str, float]:
+def evaluate_detection_scenarios(
+    samples: List[Tuple[str, str, str, List[str]]],
+    model_name: str,
+    device: torch.device,
+    trials: int = 10,
+) -> Dict[str, float]:
     """
-    samples: list of (img_path, cls_label, concept_text, present_concepts)
-    Returns mean AUROC over the defined scenarios using CLIP image-text similarity S.
+    Paper protocol: for each scenario (c1, c2, k), compute AUROC between
+    positives = images of class c1 where k is present and
+    negatives = images of class c1 where k is absent.
+    Perform 10 random balanced subsampling runs per scenario and average.
     """
     model = CLIPModel.from_pretrained(model_name).to(device)
     processor = CLIPProcessor.from_pretrained(model_name)
 
     aucs: List[float] = []
 
-    for (c1, c2, k) in SCENARIOS:
+    detection_runs = max(1, int(trials))
+    rng = np.random.RandomState(42)
+
+    for (c1, c2, k_raw) in SCENARIOS:
+        k = normalize_text(k_raw)
+
         # gather subsets
-        scores_present: List[float] = []
-        scores_absent_c1: List[float] = []
-        scores_absent_c2: List[float] = []
+        scores_present: List[float] = []  # c1 & k present
+        scores_absent_c1: List[float] = []  # c1 & k absent
+
         for img_path, cls_label, _, present_list in samples:
-            if cls_label != c1 and cls_label != c2:
-                continue
-            # concept present in image?
+            if cls_label != c1:
+                continue  # only class c1 is considered in paper evaluation
             is_present = any(normalize_text(x) == k for x in present_list)
             try:
                 img = Image.open(img_path).convert("RGB")
             except Exception:
                 continue
             s = compute_image_text_score(model, processor, img, k, device)
-            if cls_label == c1 and is_present:
+
+            if is_present:
                 scores_present.append(s)
-            elif cls_label == c1 and not is_present:
+            else:
                 scores_absent_c1.append(s)
-            elif cls_label == c2:
-                scores_absent_c2.append(s)
 
-        # present vs (absent in c1 + c2) AUROC
-        y_true: List[int] = []
-        y_score: List[float] = []
-        for s in scores_present:
-            y_true.append(1)
-            y_score.append(s)
-        for s in (scores_absent_c1 + scores_absent_c2):
-            y_true.append(0)
-            y_score.append(s)
+        # skip scenarios without both subsets
+        if not scores_present or not scores_absent_c1:
+            continue
 
-        if len(set(y_true)) == 2 and len(y_true) >= 3:
+        # Balanced subsampling runs
+        n = min(len(scores_present), len(scores_absent_c1))
+        if n <= 0:
+            continue
+        for run_idx in range(detection_runs):
+            rs = np.random.RandomState(rng.randint(0, 2**31 - 1))
+            pos_idx = rs.choice(len(scores_present), size=n, replace=False)
+            neg_idx = rs.choice(len(scores_absent_c1), size=n, replace=False)
+
+            y_true: List[int] = [1] * n + [0] * n
+            y_score: List[float] = [scores_present[i] for i in pos_idx] + [scores_absent_c1[j] for j in neg_idx]
+
             try:
                 auc = float(roc_auc_score(y_true, y_score))
                 aucs.append(auc)
             except Exception:
-                pass
+                continue
 
     return {"AUROC_mean": float(np.mean(aucs)) if aucs else 0.0, "AUROC_count": len(aucs)}
 
@@ -476,6 +491,7 @@ def main():
     parser.add_argument("--no-localization", action="store_true", help="Skip localization metrics")
     parser.add_argument("--save-examples-dir", type=str, default=None, help="Directory to save example visualizations")
     parser.add_argument("--examples-per-class", type=int, default=5, help="Max examples to save per class")
+    parser.add_argument("--trials", type=int, default=10, help="Number of balanced subsampling runs per scenario (paper default: 10)")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -492,8 +508,13 @@ def main():
         print("Localization:", loc_metrics)
 
     if not args.no_detection:
-        print("Running scenario-based detection AUROC ...")
-        det_metrics = evaluate_detection_scenarios(detection_samples, args.model_name, device)
+        print("Running scenario-based detection AUROC (paper protocol: c1-present vs c1-absent, %d runs) ..." % args.trials)
+        det_metrics = evaluate_detection_scenarios(
+            detection_samples,
+            args.model_name,
+            device,
+            trials=args.trials,
+        )
         print("Detection:", det_metrics)
 
 
