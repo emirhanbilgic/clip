@@ -445,8 +445,8 @@ def collect_dataset_pairs(dataset_root: str) -> Tuple[List[Tuple[str, str, List[
         except Exception:
             continue
 
-        cls_label = infer_class_from_path(img_path) or (xml_folder if xml_folder else "")
-        cls_label = normalize_text(cls_label)
+        cls_raw = infer_class_from_path(img_path) or (xml_folder if xml_folder else "")
+        cls_label = map_class_name(cls_raw) or normalize_text(cls_raw)
         present_concepts: List[str] = []
 
         # group by concept
@@ -458,7 +458,7 @@ def collect_dataset_pairs(dataset_root: str) -> Tuple[List[Tuple[str, str, List[
 
         # localization for images where concept is present
         for cname_norm, boxes in concept_to_boxes.items():
-            concept_text = CONCEPT_PROMPT_MAP.get(cname_norm, cname_norm)
+            concept_text = CONCEPT_ALIASES.get(cname_norm, cname_norm)
             localization_pairs.append((img_path, concept_text, boxes))
 
         # detection sample entry
