@@ -374,6 +374,7 @@ def evaluate_detection_scenarios(
     model_name: str,
     device: torch.device,
     trials: int = 10,
+    debug: bool = False,
 ) -> Dict[str, float]:
     """
     Paper protocol: for each scenario (c1, c2, k), compute AUROC between
@@ -385,6 +386,8 @@ def evaluate_detection_scenarios(
     processor = CLIPProcessor.from_pretrained(model_name)
 
     aucs: List[float] = []
+    scenarios_used = 0
+    skipped_scenarios: List[str] = []
 
     detection_runs = max(1, int(trials))
     rng = np.random.RandomState(42)
@@ -413,12 +416,16 @@ def evaluate_detection_scenarios(
 
         # skip scenarios without both subsets
         if not scores_present or not scores_absent_c1:
+            if debug:
+                print(f"[SKIP] scenario (c1={c1}, c2={c2}, k={k}): present={len(scores_present)}, absent={len(scores_absent_c1)}")
+            skipped_scenarios.append(f"(c1={c1}, c2={c2}, k={k})")
             continue
 
         # Balanced subsampling runs
         n = min(len(scores_present), len(scores_absent_c1))
         if n <= 0:
             continue
+        scenarios_used += 1
         for run_idx in range(detection_runs):
             rs = np.random.RandomState(rng.randint(0, 2**31 - 1))
             pos_idx = rs.choice(len(scores_present), size=n, replace=False)
@@ -432,8 +439,19 @@ def evaluate_detection_scenarios(
                 aucs.append(auc)
             except Exception:
                 continue
+        if debug:
+            print(f"[OK] scenario (c1={c1}, c2={c2}, k={k}): present={len(scores_present)}, absent={len(scores_absent_c1)}, trials={detection_runs}")
 
-    return {"AUROC_mean": float(np.mean(aucs)) if aucs else 0.0, "AUROC_count": len(aucs)}
+    if debug and skipped_scenarios:
+        print("Skipped scenarios:")
+        for sc in skipped_scenarios:
+            print("  -", sc)
+
+    return {
+        "AUROC_mean": float(np.mean(aucs)) if aucs else 0.0,
+        "AUROC_count": len(aucs),
+        "Scenarios_used": scenarios_used,
+    }
 
 
 def collect_dataset_pairs(dataset_root: str) -> Tuple[List[Tuple[str, str, List[Tuple[int, int, int, int]]]], List[Tuple[str, str, str, List[str]]]]:
@@ -492,6 +510,7 @@ def main():
     parser.add_argument("--save-examples-dir", type=str, default=None, help="Directory to save example visualizations")
     parser.add_argument("--examples-per-class", type=int, default=5, help="Max examples to save per class")
     parser.add_argument("--trials", type=int, default=10, help="Number of balanced subsampling runs per scenario (paper default: 10)")
+    parser.add_argument("--debug-detection", action="store_true", help="Print per-scenario counts and skip reasons for detection")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -514,6 +533,7 @@ def main():
             args.model_name,
             device,
             trials=args.trials,
+            debug=args.debug_detection,
         )
         print("Detection:", det_metrics)
 
