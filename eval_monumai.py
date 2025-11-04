@@ -261,6 +261,29 @@ def save_example_visualization(save_path: str, img_224: Image.Image, saliency_22
     plt.close(fig)
 
 
+def save_mask_comparison(save_path: str, img_224: Image.Image, gt_mask_224: np.ndarray, pred_mask_224: np.ndarray, title_left: str, title_right: str):
+    import matplotlib.pyplot as plt
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig, ax = plt.subplots(1, 2, figsize=(9, 4))
+
+    # Left: GT mask overlay
+    ax[0].imshow(img_224)
+    ax[0].imshow(gt_mask_224, cmap="Reds", alpha=0.45)
+    ax[0].axis("off")
+    ax[0].set_title(title_left)
+
+    # Right: Predicted mask overlay
+    ax[1].imshow(img_224)
+    ax[1].imshow(pred_mask_224, cmap="Greens", alpha=0.45)
+    ax[1].axis("off")
+    ax[1].set_title(title_right)
+
+    plt.tight_layout()
+    fig.savefig(save_path, bbox_inches="tight", dpi=180)
+    plt.close(fig)
+
+
 def compute_image_text_score(model: CLIPModel, processor: CLIPProcessor, img: Image.Image, concept_text: str, device: torch.device) -> float:
     with torch.no_grad():
         text_inputs = processor(text=[concept_text], return_tensors="pt", padding=True).to(device)
@@ -362,6 +385,17 @@ def evaluate_localization(pairs: List[Tuple[str, str, List[Tuple[int, int, int, 
                 title_r = "Saliency + GT"
                 try:
                     save_example_visualization(out_path, img_224, sal_224, boxes_224, title_l, title_r)
+                    # Also save GT vs Pred mask overlays
+                    top_label = f"top{int(topk_percent)}%" if topk_percent is not None else "mean"
+                    out_mask = os.path.join(subdir, f"{stem}_{concept_text.replace(' ', '_')}_{top_label}_masks.png")
+                    save_mask_comparison(
+                        out_mask,
+                        img_224,
+                        gt_mask.astype(np.uint8),
+                        pred_bin.astype(np.uint8),
+                        title_left="GT mask",
+                        title_right=f"Pred mask ({top_label})",
+                    )
                     per_class_saved[cls_label] = count + 1
                 except Exception:
                     pass
