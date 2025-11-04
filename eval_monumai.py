@@ -375,6 +375,8 @@ def evaluate_detection_scenarios(
     device: torch.device,
     trials: int = 10,
     debug: bool = False,
+    save_examples_dir: Optional[str] = None,
+    examples_per_class: int = 5,
 ) -> Dict[str, float]:
     """
     Paper protocol: for each scenario (c1, c2, k), compute AUROC between
@@ -391,6 +393,10 @@ def evaluate_detection_scenarios(
 
     detection_runs = max(1, int(trials))
     rng = np.random.RandomState(42)
+
+    # per-class saved counters split by polarity
+    per_class_pos_saved: Dict[str, int] = {}
+    per_class_neg_saved: Dict[str, int] = {}
 
     for (c1, c2, k_raw) in SCENARIOS:
         k = normalize_text(k_raw)
@@ -413,6 +419,53 @@ def evaluate_detection_scenarios(
                 scores_present.append(s)
             else:
                 scores_absent_c1.append(s)
+
+            # Optionally save visualization for positives and negatives
+            if save_examples_dir:
+                try:
+                    cls_norm = normalize_text(cls_label)
+                    bucket = "pos" if is_present else "neg"
+                    if is_present:
+                        count = per_class_pos_saved.get(cls_norm, 0)
+                    else:
+                        count = per_class_neg_saved.get(cls_norm, 0)
+                    if count < examples_per_class:
+                        # compute saliency heatmap for (img, k)
+                        sal_vec, image_size = compute_saliency_for_image(model, processor, img, k, device)
+                        sal_grid = upsample_saliency_to_pixels(sal_vec, image_size)
+
+                        # get GT boxes for k if present (for overlay)
+                        boxes_224: List[Tuple[int, int, int, int]] = []
+                        xml_path = find_xml_for_image(img_path)
+                        if xml_path:
+                            try:
+                                objects, _, (W, H) = parse_monumai_xml(xml_path)
+                                # filter boxes for current concept k
+                                k_boxes = [b for (cname, b) in objects if normalize_text(cname) == k]
+                                if k_boxes and W > 0 and H > 0:
+                                    boxes_224 = transform_boxes_to_clip_coords(k_boxes, (W, H), target_size=image_size)
+                            except Exception:
+                                boxes_224 = []
+
+                        # prepare image at 224
+                        img_224 = transform_image_to_clip_224(img, target_size=image_size)
+
+                        # paths
+                        subdir = os.path.join(save_examples_dir, cls_norm, bucket)
+                        os.makedirs(subdir, exist_ok=True)
+                        stem = os.path.splitext(os.path.basename(img_path))[0]
+                        out_path = os.path.join(subdir, f"{stem}_{k.replace(' ', '_')}.png")
+                        title_l = f"GT: {cls_norm} / {k}"
+                        title_r = f"Saliency + {'GT' if boxes_224 else 'NoGT'}"
+                        save_example_visualization(out_path, img_224, sal_grid.astype(np.float32), boxes_224, title_l, title_r)
+
+                        if is_present:
+                            per_class_pos_saved[cls_norm] = count + 1
+                        else:
+                            per_class_neg_saved[cls_norm] = count + 1
+                except Exception:
+                    # best-effort saving; ignore failures
+                    pass
 
         # skip scenarios without both subsets
         if not scores_present or not scores_absent_c1:
@@ -534,6 +587,8 @@ def main():
             device,
             trials=args.trials,
             debug=args.debug_detection,
+            save_examples_dir=args.save_examples_dir,
+            examples_per_class=args.examples_per_class,
         )
         print("Detection:", det_metrics)
 
