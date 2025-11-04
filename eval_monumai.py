@@ -4,6 +4,7 @@ import math
 import glob
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Tuple, Optional
+import unicodedata
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -17,23 +18,54 @@ from clip_concept_attention import compute_patch_saliency_joint
 
 def normalize_text(s: str) -> str:
     s = s.strip().lower()
+    # remove diacritics
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode("ascii")
     s = s.replace("_", " ")
     s = s.replace("-", " ")
     return " ".join(s.split())
 
 
-CONCEPT_PROMPT_MAP: Dict[str, str] = {
-    # MonuMAI concepts (normalize variations to a clean text prompt)
-    "lobed arch": "lobed arch",
-    "porthole": "porthole",
-    "broken pediment": "broken pediment",
-    "solomonic column": "solomonic column",
-    "pointed arch": "pointed arch",
-    "serliana": "serliana",
-    "trefoil arch": "trefoil arch",
-    "rounded arch": "rounded arch",
-    "ogee arch": "ogee arch",
+STANDARD_CONCEPTS = {
+    "lobed arch",
+    "porthole",
+    "broken pediment",
+    "solomonic column",
+    "pointed arch",
+    "serliana",
+    "trefoil arch",
+    "rounded arch",
+    "ogee arch",
 }
+
+# Spanish/English aliases to standard concept names
+CONCEPT_ALIASES: Dict[str, str] = {}
+_concept_pairs = [
+    ("lobed arch", ["lobed arch", "arco lobulado", "arco trilobulado", "multilobed arch", "lobulado"]),
+    ("porthole", ["porthole", "ojo de buey", "oculus"]),
+    ("broken pediment", ["broken pediment", "fronton partido", "fronton roto"]),
+    ("solomonic column", ["solomonic column", "columna salomonica", "salomonica"]),
+    ("pointed arch", ["pointed arch", "arco apuntado", "arco ojival", "ogival arch", "ojival"]),
+    ("serliana", ["serliana", "serliana arch", "arquitectura serliana"]),
+    ("trefoil arch", ["trefoil arch", "arco trefoil", "arco trilobulado", "trifolio", "arco trebolado"]),
+    ("rounded arch", ["rounded arch", "round arch", "semi circular arch", "semicircular arch", "arco de medio punto", "medio punto"]),
+    ("ogee arch", ["ogee arch", "arco conopial", "conopial"]),
+]
+for std, aliases in _concept_pairs:
+    for a in aliases:
+        CONCEPT_ALIASES[normalize_text(a)] = std
+
+# Class aliases to standard class names used in scenarios
+CLASS_ALIASES: Dict[str, str] = {}
+_class_pairs = [
+    ("baroque", ["baroque", "barroco"]),
+    ("gothic", ["gothic", "gotico", "gotico", "gotico", "gotico", "gotico", "gotico", "gotico", "gotico", "gotico", "gotico", "gotico", "gotico", "gotico"]),
+    ("renaissance", ["renaissance", "renacentista", "renacimiento"]),
+    ("hispanic-muslim", ["hispanic muslim", "hispanic-muslim", "hispanomusulman", "hispanomusulman", "hispanomusulman", "hispanomusulman"]),
+]
+for std, aliases in _class_pairs:
+    for a in aliases:
+        CLASS_ALIASES[normalize_text(a)] = std
 
 
 SCENARIOS = [
@@ -49,16 +81,25 @@ SCENARIOS = [
 ]
 
 
+def map_class_name(name: str) -> Optional[str]:
+    n = normalize_text(name)
+    if n in CLASS_ALIASES:
+        return CLASS_ALIASES[n]
+    # try direct if already standard
+    if n in {"baroque", "gothic", "renaissance", "hispanic muslim", "hispanic-muslim"}:
+        return "hispanic-muslim" if n in {"hispanic muslim", "hispanic-muslim"} else n
+    return None
+
+
 def infer_class_from_path(path: str) -> Optional[str]:
     lower = path.lower()
-    for cls in ["baroque", "gothic", "renaissance", "hispanic-muslim"]:
+    for cls in ["baroque", "gothic", "renaissance", "hispanic-muslim", "hispanic muslim"]:
         if f"/{cls}/" in lower or lower.endswith(f"/{cls}"):
-            return cls
+            return map_class_name(cls)
     # fallback: use immediate parent dir name
-    base = os.path.basename(os.path.dirname(path)).lower()
-    if base in {"baroque", "gothic", "renaissance", "hispanic-muslim"}:
-        return base
-    return None
+    base = os.path.basename(os.path.dirname(path))
+    mapped = map_class_name(base)
+    return mapped
 
 
 def find_xml_for_image(img_path: str) -> Optional[str]:
@@ -103,14 +144,10 @@ def parse_monumai_xml(xml_path: str) -> Tuple[List[Tuple[str, Tuple[int, int, in
         except Exception:
             continue
         c_name = normalize_text(name_tag)
-        # try to map to known set if possible
-        if c_name in CONCEPT_PROMPT_MAP:
-            mapped = CONCEPT_PROMPT_MAP[c_name]
-        else:
-            mapped = c_name
+        mapped = CONCEPT_ALIASES.get(c_name, c_name)
         objects.append((mapped, (xmin, ymin, xmax, ymax)))
 
-    clabel = folder.lower() if folder else None
+    clabel = map_class_name(folder) if folder else None
     return objects, clabel, (W or -1, H or -1)
 
 
