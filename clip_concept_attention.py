@@ -74,16 +74,50 @@ def visualize_saliency_on_image(img: Image.Image, saliency: np.ndarray, grid_siz
     # upsample to image size for overlay
     sal_map_up = np.kron(sal_map, np.ones((img_arr.shape[0] // h_p, img_arr.shape[1] // w_p)))
 
-    fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+    fig, ax = plt.subplots(1, 3, figsize=(18, 6))
+    
+    # Original image
     ax[0].imshow(img_arr)
     ax[0].axis("off")
     ax[0].set_title("Original image")
 
+    # Heatmap overlay
     ax[1].imshow(img_arr)
     ax[1].imshow(sal_map_up, cmap="jet", alpha=0.45, norm=Normalize(vmin=sal_map_up.min(), vmax=sal_map_up.max()))
     ax[1].axis("off")
     ax[1].set_title(title or "Concept saliency overlay")
+    
+    # Grid with numerical scores
+    ax[2].imshow(img_arr)
+    ax[2].imshow(sal_map_up, cmap="jet", alpha=0.25, norm=Normalize(vmin=sal_map_up.min(), vmax=sal_map_up.max()))
+    ax[2].axis("off")
+    ax[2].set_title("Saliency scores (higher = more relevant)")
+    
+    # Overlay text scores on grid
+    patch_h = img_arr.shape[0] / h_p
+    patch_w = img_arr.shape[1] / w_p
+    for i in range(h_p):
+        for j in range(w_p):
+            score = sal_map[i, j]
+            # Position text at center of each patch
+            y_center = (i + 0.5) * patch_h
+            x_center = (j + 0.5) * patch_w
+            # Use contrasting color based on score
+            text_color = 'white' if score < (sal_map.max() + sal_map.min()) / 2 else 'black'
+            ax[2].text(x_center, y_center, f'{score:.3f}', 
+                      ha='center', va='center', fontsize=8, 
+                      color=text_color, fontweight='bold',
+                      bbox=dict(boxstyle='round,pad=0.3', facecolor='gray', alpha=0.5))
+    
     plt.tight_layout()
+    
+    # Print statistics
+    print(f"\nSaliency Statistics:")
+    print(f"  Min score: {sal_map.min():.4f}")
+    print(f"  Max score: {sal_map.max():.4f}")
+    print(f"  Mean score: {sal_map.mean():.4f}")
+    print(f"  Std dev: {sal_map.std():.4f}")
+    
     if save_path is not None:
         fig.savefig(save_path, bbox_inches="tight", dpi=200)
         print(f"Saved visualization to {save_path}")
