@@ -546,7 +546,7 @@ def evaluate_detection_scenarios(
     }
 
 
-def collect_dataset_pairs(dataset_root: str) -> Tuple[List[Tuple[str, str, List[Tuple[int, int, int, int]]]], List[Tuple[str, str, str, List[str]]]:
+def collect_dataset_pairs(dataset_root: str) -> Tuple[List[Tuple[str, str, List[Tuple[int, int, int, int]]]], List[Tuple[str, str, str, List[str]]]]:
     """
     Returns:
       - localization_pairs: list of (img_path, concept_text, boxes)
