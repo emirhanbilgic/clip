@@ -249,7 +249,7 @@ def save_example_visualization(save_path: str, img_224: Image.Image, saliency_22
 
     # Right: saliency heatmap overlay + boxes
     ax[1].imshow(img_224)
-    ax[1].imshow(saliency_224, cmap="gray", alpha=0.45, norm=Normalize(vmin=float(saliency_224.min()), vmax=float(saliency_224.max())))
+    ax[1].imshow(saliency_224, cmap="jet", alpha=0.45, norm=Normalize(vmin=float(saliency_224.min()), vmax=float(saliency_224.max())))
     # overlay boxes as green rectangles
     for (x0, y0, x1, y1) in boxes_224:
         ax[1].plot([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0], color="lime", linewidth=1.5)
