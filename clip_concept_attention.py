@@ -80,7 +80,7 @@ def visualize_saliency_on_image(img: Image.Image, saliency: np.ndarray, grid_siz
     ax[0].set_title("Original image")
 
     ax[1].imshow(img_arr)
-    ax[1].imshow(sal_map_up, cmap="jet", alpha=0.45, norm=Normalize(vmin=sal_map_up.min(), vmax=sal_map_up.max()))
+    ax[1].imshow(sal_map_up, cmap="gray", alpha=0.45, norm=Normalize(vmin=sal_map_up.min(), vmax=sal_map_up.max()))
     ax[1].axis("off")
     ax[1].set_title(title or "Concept saliency overlay")
     plt.tight_layout()
